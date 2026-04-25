@@ -1,0 +1,10 @@
+services:
+  - type: worker
+    name: yuklab-olish-bot
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    envVars:
+      - key: BOT_TOKEN
+        value: 8738914730:AAFLlh4_omzDLi36zZyJ-EiMHReHt3L2EIE
+      - key: PYTHONUNBUFFERED
+        value: "1"
