@@ -11,6 +11,7 @@ import os
 import re
 import sys
 import glob
+import time
 import asyncio
 import logging
 import subprocess
@@ -53,6 +54,26 @@ logging.basicConfig(
     level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
+
+
+def _safe_filesize(stream) -> int:
+    """Stream hajmini xavfsiz olish (xatolik bo'lsa 0 qaytaradi)."""
+    try:
+        return stream.filesize or 0
+    except Exception:
+        return 0
+
+
+def _cleanup_old_files(max_age_seconds: int = 3600):
+    """1 soatdan eski fayllarni tozalash."""
+    try:
+        now = time.time()
+        for f in DOWNLOAD_DIR.glob("*"):
+            if f.is_file() and (now - f.stat().st_mtime) > max_age_seconds:
+                f.unlink(missing_ok=True)
+                logger.info(f"Eski fayl tozalandi: {f.name}")
+    except Exception as e:
+        logger.warning(f"Tozalashda xatolik: {e}")
 
 
 # ─────────────────────────────────────────────
@@ -111,7 +132,8 @@ def get_youtube_qualities(url: str) -> dict:
     for s in progressive:
         res = s.resolution
         if res and res not in available:
-            size_mb = round(s.filesize / (1024 * 1024), 1) if s.filesize else 0
+            fsize = _safe_filesize(s)
+            size_mb = round(fsize / (1024 * 1024), 1) if fsize else 0
             available[res] = {"size_mb": size_mb, "type": "progressive"}
 
     # 2. Adaptive streamlar (faqat video, audio alohida — FFmpeg bilan birlashtiriladi)
@@ -119,8 +141,8 @@ def get_youtube_qualities(url: str) -> dict:
     for s in adaptive:
         res = s.resolution
         if res and res not in available:
-            # Video hajmi + taxminiy audio hajmi (~2 MB)
-            video_size = s.filesize / (1024 * 1024) if s.filesize else 0
+            fsize = _safe_filesize(s)
+            video_size = fsize / (1024 * 1024) if fsize else 0
             total_size = round(video_size + 2.0, 1)
             available[res] = {"size_mb": total_size, "type": "adaptive"}
 
@@ -351,7 +373,9 @@ async def download_with_ytdlp(url: str, platform: str, chat_id: int) -> list[dic
     """yt-dlp orqali Instagram/Pinterest dan yuklab oladi."""
     import yt_dlp
 
-    output_template = str(DOWNLOAD_DIR / f"{chat_id}_%(id)s.%(ext)s")
+    # Unikal ID — boshqa yuklashlar bilan aralashmasligi uchun
+    unique_id = f"{chat_id}_{int(time.time())}"
+    output_template = str(DOWNLOAD_DIR / f"{unique_id}_%(id)s.%(ext)s")
 
     if platform == "instagram":
         ydl_opts = {
@@ -383,8 +407,9 @@ async def download_with_ytdlp(url: str, platform: str, chat_id: int) -> list[dic
     if info is None:
         raise RuntimeError("Media ma'lumotlarini olishda xatolik.")
 
+    # Faqat shu yuklash fayllarini topish (unique_id bilan)
     downloaded_files = sorted(
-        glob.glob(str(DOWNLOAD_DIR / f"{chat_id}_*")),
+        glob.glob(str(DOWNLOAD_DIR / f"{unique_id}_*")),
         key=os.path.getmtime,
         reverse=True,
     )
@@ -473,9 +498,9 @@ def _escape_html(text: str) -> str:
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text
-    if not text:
+    if not update.message or not update.message.text:
         return
+    text = update.message.text
 
     url = extract_url(text)
     if not url:
@@ -534,11 +559,12 @@ async def handle_youtube_quality(update: Update, context: ContextTypes.DEFAULT_T
             return
 
         video_id = _extract_video_id(url)
+        cb_vid = video_id[:20]
 
         # URL ni contextda saqlash
         if "yt_urls" not in context.user_data:
             context.user_data["yt_urls"] = {}
-        context.user_data["yt_urls"][video_id] = url
+        context.user_data["yt_urls"][cb_vid] = url
 
         # Inline tugmalar yaratish
         buttons = []
@@ -575,7 +601,9 @@ async def handle_youtube_quality(update: Update, context: ContextTypes.DEFAULT_T
             # Siqilishi kerak bo'lsa belgi
             compress_mark = " ⚡" if will_compress else ""
 
-            callback_data = f"yt|{res}|{video_id}"
+            # Telegram callback_data limiti 64 bayt
+            cb_vid = video_id[:20]
+            callback_data = f"yt|{res}|{cb_vid}"
 
             buttons.append([
                 InlineKeyboardButton(
@@ -714,7 +742,12 @@ async def send_media(update, status_msg, media_list, platform_name):
     for media in media_list:
         filepath = media["path"]
         media_type = media["type"]
-        file_size = os.path.getsize(filepath)
+
+        try:
+            file_size = os.path.getsize(filepath)
+        except OSError:
+            logger.error(f"Fayl topilmadi: {filepath}")
+            continue
 
         if file_size > TG_FILE_LIMIT:
             await status_msg.edit_text(
@@ -736,6 +769,8 @@ async def send_media(update, status_msg, media_list, platform_name):
                         read_timeout=60, write_timeout=60, connect_timeout=30,
                     )
             sent_count += 1
+        except Exception as e:
+            logger.error(f"Media yuborishda xatolik: {e}", exc_info=True)
         finally:
             _safe_remove(filepath)
 
@@ -778,10 +813,18 @@ def _get_error_message(error: Exception, platform: str) -> str:
 # ─────────────────────────────────────────────
 # 🚀  Botni ishga tushirish
 # ─────────────────────────────────────────────
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    """Global xatolik handler — bot crash bo'lmasligi uchun."""
+    logger.error(f"Kutilmagan xatolik: {context.error}", exc_info=context.error)
+
+
 async def main():
     if BOT_TOKEN == "BOT_TOKENINGIZNI_SHU_YERGA_YOZING":
         print("❌ XATOLIK: Bot tokenini sozlang!")
         return
+
+    # Ishga tushganda eski fayllarni tozalash
+    _cleanup_old_files()
 
     print("🤖 Bot ishga tushmoqda...")
     print(f"📂 Yuklab olish papkasi: {DOWNLOAD_DIR}")
@@ -793,6 +836,7 @@ async def main():
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CallbackQueryHandler(handle_quality_callback, pattern=r"^yt\|"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_error_handler(error_handler)
 
     print("✅ Bot tayyor! Xabarlar kutilmoqda...")
 
@@ -801,7 +845,8 @@ async def main():
         await app.start()
         try:
             while True:
-                await asyncio.sleep(1)
+                await asyncio.sleep(3600)
+                _cleanup_old_files()  # Har soatda eski fayllarni tozalash
         except asyncio.CancelledError:
             pass
         finally:
